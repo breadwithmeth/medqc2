@@ -1,54 +1,95 @@
-import os
-from fastapi import FastAPI, UploadFile, File, Body, HTTPException
+# app/main.py
+from __future__ import annotations
+import os, time, uuid
+from typing import Any, Dict
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from .pdf_utils import extract_text_from_pdf_bytes, normalize_text
-from .rules_loader import load_llm_rules
-from .audit_engine_llm import run_llm_rules_batched, run_llm_rules
-from .models import AuditResponse, TextReq
+from app.audit_engine_stac import audit_stac
+from app.pdf_text import extract_text_from_pdf
 
-RULES_DIR = os.getenv("RULES_DIR", "./rules")
-USE_BATCH = os.getenv("USE_BATCH", "1") not in ("0", "false", "False")
+APP_NAME = "Med-Audit KZ (STAC)"
+APP_VERSION = "1.0.0"
 
-llm_rules = load_llm_rules(RULES_DIR)
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-app = FastAPI(title="Med-Audit KZ (Ollama API)", version="1.1.0")
-
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=origins or ["*"],  # на проде лучше перечислить фронты
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
+
+class TimingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        t0 = time.perf_counter()
+        resp = await call_next(request)
+        dt = (time.perf_counter()-t0)*1000
+        print(f"[{request.method}] {request.url.path} {round(dt,1)}ms from {request.client.host}")
+        return resp
+
+app.add_middleware(TimingMiddleware)
+
+def _ok(**extra: Any) -> Dict[str, Any]:
+    return {"ok": True, **extra}
+
+@app.get("/", response_class=PlainTextResponse)
+def root() -> str:
+    return f"{APP_NAME} v{APP_VERSION}"
 
 @app.get("/health")
 def health():
-    return {"ok": True, "rules": len(llm_rules), "batch": USE_BATCH}
+    return _ok(
+        profile="STAC",
+        model=os.getenv("STAC_MODEL", "medaudit:stac-fast"),
+        ollama_url=os.getenv("OLLAMA_URL",""),
+        ctx=int(os.getenv("OLLAMA_NUM_CTX","3072")),
+        num_predict=int(os.getenv("NUM_PREDICT","90")),
+        allowed_origins=origins or ["*"]
+    )
 
-@app.get("/rules")
-def rules():
-    return {"count": len(llm_rules), "rules": [r.model_dump() for r in llm_rules]}
+@app.post("/audit/text_stac")
+async def audit_text_stac(payload: dict):
+    text = (payload or {}).get("text","").strip()
+    if not text:
+        raise HTTPException(400, "text is required")
+    t0 = time.perf_counter()
+    data = audit_stac(text)
+    data["doc_name"] = ""
+    data["elapsed_ms"] = round((time.perf_counter()-t0)*1000,1)
+    return JSONResponse(data)
 
-def _run(text: str):
-    try:
-        if USE_BATCH:
-            return run_llm_rules_batched(text, llm_rules)
-        return run_llm_rules(text, llm_rules)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
+@app.post("/audit/pdf_stac")
+async def audit_pdf_stac(file: UploadFile = File(...)):
+    fname = (file.filename or "").lower()
+    if not fname.endswith(".pdf"):
+        raise HTTPException(400, "PDF required")
+    blob = await file.read()
+    trace_id = uuid.uuid4().hex[:8]
+    t0 = time.perf_counter()
+    t_pdf = time.perf_counter()
+    text = extract_text_from_pdf(blob)
+    pdf_ms = round((time.perf_counter() - t_pdf)*1000, 1)
+    if not text.strip():
+        raise HTTPException(400, "empty PDF text")
 
-@app.post("/audit/text", response_model=AuditResponse)
-async def audit_text(req: TextReq = Body(...)):
-    t = normalize_text(req.text or "")
-    passes, violations = _run(t)
-    return AuditResponse(ok=True, doc_name=None, rules_total=len(llm_rules),
-                         violations=violations, passes=passes)
+    data = audit_stac(text)
+    data["doc_name"] = file.filename
+    data["pdf_extract_ms"] = pdf_ms
+    data["elapsed_ms"] = round((time.perf_counter()-t0)*1000,1)
 
-@app.post("/audit/pdf", response_model=AuditResponse)
-async def audit_pdf(file: UploadFile = File(...)):
-    data = await file.read()
-    t = extract_text_from_pdf_bytes(data)
-    passes, violations = _run(t)
-    return AuditResponse(ok=True, doc_name=file.filename, rules_total=len(llm_rules),
-                         violations=violations, passes=passes)
+    resp = JSONResponse(data)
+    resp.headers["X-Trace-Id"] = trace_id
+    return resp
+
+@app.exception_handler(HTTPException)
+async def http_exc_handler(_: Request, exc: HTTPException):
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+@app.exception_handler(Exception)
+async def unhandled_exc_handler(_: Request, exc: Exception):
+    return JSONResponse({"detail": f"internal error: {type(exc).__name__}"}, status_code=500)
