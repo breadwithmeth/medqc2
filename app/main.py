@@ -1,54 +1,77 @@
+# app/main.py (фрагмент)
 import os
-from fastapi import FastAPI, UploadFile, File, Body, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
-from .pdf_utils import extract_text_from_pdf_bytes, normalize_text
 from .rules_loader import load_llm_rules
-from .audit_engine_llm import run_llm_rules_batched, run_llm_rules
-from .models import AuditResponse, TextReq
+from .audit_engine_llm import run_llm_rules
+from .pdf_text import extract_text_from_pdf
+from .router_llm import detect_profiles
 
-RULES_DIR = os.getenv("RULES_DIR", "./rules")
-USE_BATCH = os.getenv("USE_BATCH", "1") not in ("0", "false", "False")
+RULES_DIR = os.getenv("RULES_DIR", "rules")
+AUTO_ROUTING = os.getenv("AUTO_ROUTING", "1") == "1"
 
 llm_rules = load_llm_rules(RULES_DIR)
 
-app = FastAPI(title="Med-Audit KZ (Ollama API)", version="1.1.0")
+def _prefix(rule_id: str) -> str:
+    return (rule_id or "").split("-")[0].upper() if rule_id else ""
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _filter_rules_by_profiles(rules, profiles):
+    if not profiles:
+        return rules
+    keep = set([p.upper() for p in profiles] + ["GEN"])
+    out = []
+    for r in rules:
+        pref = _prefix(r.id if hasattr(r, "id") else r.get("id"))
+        if pref in keep:
+            out.append(r)
+    return out
+
+app = FastAPI()
+
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","*").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=origins or ["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
 def health():
-    return {"ok": True, "rules": len(llm_rules), "batch": USE_BATCH}
+    return {
+        "ok": True,
+        "rules": len(llm_rules),
+        "auto_routing": AUTO_ROUTING,
+        "router_model": os.getenv("ROUTER_MODEL") or os.getenv("OLLAMA_MODEL")
+    }
 
-@app.get("/rules")
-def rules():
-    return {"count": len(llm_rules), "rules": [r.model_dump() for r in llm_rules]}
+def _route_and_audit(text: str, doc_name: str | None = None):
+    profiles, conf, reason, from_llm = ([], {}, "", False)
+    rules_to_use = llm_rules
+    if AUTO_ROUTING:
+        profiles, conf, reason, from_llm = detect_profiles(text, limit=int(os.getenv("ROUTER_LIMIT","6")))
+        rules_to_use = _filter_rules_by_profiles(llm_rules, profiles)
 
-def _run(text: str):
-    try:
-        if USE_BATCH:
-            return run_llm_rules_batched(text, llm_rules)
-        return run_llm_rules(text, llm_rules)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
+    passes, violations = run_llm_rules(text, rules_to_use)
+    return {
+        "doc_name": doc_name or "",
+        "profiles_detected": profiles,
+        "profiles_confidence": conf,
+        "profiles_reason": reason,
+        "profiles_source": "llm" if from_llm else "heuristic",
+        "rules_total": len(rules_to_use),
+        "passes": passes,
+        "violations": violations,
+    }
 
-@app.post("/audit/text", response_model=AuditResponse)
-async def audit_text(req: TextReq = Body(...)):
-    t = normalize_text(req.text or "")
-    passes, violations = _run(t)
-    return AuditResponse(ok=True, doc_name=None, rules_total=len(llm_rules),
-                         violations=violations, passes=passes)
+@app.post("/audit/text")
+async def audit_text(payload: dict):
+    text = (payload or {}).get("text", "").strip()
+    if not text:
+        raise HTTPException(400, "text is required")
+    return _route_and_audit(text, doc_name="")
 
-@app.post("/audit/pdf", response_model=AuditResponse)
+@app.post("/audit/pdf")
 async def audit_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "PDF required")
     data = await file.read()
-    t = extract_text_from_pdf_bytes(data)
-    passes, violations = _run(t)
-    return AuditResponse(ok=True, doc_name=file.filename, rules_total=len(llm_rules),
-                         violations=violations, passes=passes)
+    text = extract_text_from_pdf(data)
+    if not text.strip():
+        raise HTTPException(400, "empty PDF text")
+    return _route_and_audit(text, doc_name=file.filename)

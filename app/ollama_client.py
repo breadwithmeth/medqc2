@@ -12,6 +12,7 @@ TIMEOUT_READ = float(os.getenv("OLLAMA_TIMEOUT_READ", "600")) # подняли �
 RETRIES = int(os.getenv("OLLAMA_RETRIES", "2"))
 KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE_REQ", "24h")        # держать модель в памяти (дополнительно к сервису)
 NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "160"))     # JSON короткий — ограничим
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "medaudit:kz")
 
 DEFAULT_SYS = (
   "Ты — аудитор медицинских документов Республики Казахстан. "
@@ -64,26 +65,34 @@ def _slice_doc_for_prompt(prompt_head: str, doc_text: str, reserve_tokens: int =
     max_doc_chars = int(max_doc_tokens * CHARS_PER_TOKEN)
     return (doc_text or "")[:max_doc_chars]
 
-def chat_ollama(system: str, question: str, doc_text: str) -> str:
-    _preflight()
-    head = f"{question}\n\n---\nТЕКСТ ДОКУМЕНТА (усечён):\n"
-    chunk = _slice_doc_for_prompt(head, doc_text)
+def chat_ollama(system: str, question: str, text: str,
+                model: str | None = None,
+                temperature: float = 0.2,
+                num_predict: int | None = None,
+                num_ctx: int | None = None,
+                timeout: int | None = None) -> str:
     body = {
-        "model": OLLAMA_MODEL,
+        "model": model or DEFAULT_MODEL,
         "messages": [
-            {"role": "system", "content": system or DEFAULT_SYS},
-            {"role": "user", "content": head + chunk},
+            {"role": "system", "content": system or ""},
+            {"role": "user", "content": f"{question}\n\n-----\n{text}"}
         ],
         "options": {
-            "temperature": TEMPERATURE,
-            "num_ctx": NUM_CTX,
-            "num_predict": NUM_PREDICT
+            "temperature": temperature,
         },
-        "keep_alive": KEEP_ALIVE,
-        "stream": False
+        "stream": False,
     }
-    data = _post_chat(body)
-    return data["message"]["content"]
+    if num_predict is not None:
+        body["options"]["num_predict"] = num_predict
+    if num_ctx is not None:
+        body["options"]["num_ctx"] = num_ctx
+
+    t_read = timeout or int(os.getenv("OLLAMA_TIMEOUT_READ", "600"))
+    t_conn = int(os.getenv("OLLAMA_TIMEOUT_CONNECT", "5"))
+    r = requests.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=(t_conn, t_read))
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("message") or {}).get("content", "").strip()
 
 def chat_ollama_batch(system: str, rules: List[Dict[str, str]], doc_text: str) -> str:
     _preflight()
