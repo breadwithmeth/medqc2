@@ -1,47 +1,102 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, requests
+import os, sys, time, json
+from typing import Optional, Dict, Any
+import requests
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("STAC_MODEL", "medaudit:stac-strict")
 
-_session = requests.Session()
+def _join_messages(system: str, question: str, text: str) -> list[dict]:
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    # чтобы модель видела и вопрос, и текст — кладём в один user-месседж
+    u = question.strip() if question else "Проверь документ по правилам и ответь JSON."
+    if text:
+        u = f"{u}\n\n=== ДОКУМЕНТ ===\n{text}"
+    msgs.append({"role": "user", "content": u})
+    return msgs
 
 def chat_ollama(
     system: str,
-    question: str | None = None,
-    text: str = "",
-    model: str | None = None,
-    *,
-    user: str | None = None,
+    question: str,
+    text: str,
+    model: Optional[str] = None,
     temperature: float = 0.0,
-    num_predict: int | None = None,
-    num_ctx: int | None = None,
-    keep_alive: str | None = "30m",
-    timeout: int | None = None,
-    use_json_format: bool = True,
-    stop: list[str] | None = None,
+    num_predict: int = 512,
+    num_ctx: int = 3072,
+    keep_alive: str = "30m",
+    use_json_format: bool = False,
+    timeout: int = 180,
+    connect_timeout: int = 5,
+    retries: int = 1,
 ) -> str:
-    prompt = (user or question or "").strip()
-    user_content = f"{prompt}\n\n-----\n{text}" if (prompt and text) else (text or prompt)
-
-    body = {
-        "model": model or DEFAULT_MODEL,
-        "messages": [
-            {"role": "system", "content": system or ""},
-            {"role": "user", "content": user_content},
-        ],
-        "options": {"temperature": temperature},
+    """
+    Возвращает content (str) из /api/chat. При ошибке — поднимает исключение.
+    """
+    model = model or os.getenv("STAC_MODEL", "medaudit:stac-strict")
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": _join_messages(system, question, text),
+        "options": {
+            "temperature": temperature,
+            "num_predict": num_predict,
+            "num_ctx": num_ctx,
+        },
+        "keep_alive": keep_alive,
         "stream": False,
     }
-    if use_json_format: body["format"] = "json"
-    if num_predict is not None: body["options"]["num_predict"] = int(num_predict)
-    if num_ctx is not None: body["options"]["num_ctx"] = int(num_ctx)
-    if keep_alive: body["keep_alive"] = keep_alive
-    if stop: body["options"]["stop"] = list(stop)
+    if use_json_format:
+        body["format"] = "json"
 
-    t_read = timeout or int(os.getenv("OLLAMA_TIMEOUT_READ", "180"))
-    t_conn = int(os.getenv("OLLAMA_TIMEOUT_CONNECT", "5"))
-    r = _session.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=(t_conn, t_read))
-    r.raise_for_status()
-    data = r.json()
-    return (data.get("message", {}) or {}).get("content", "").strip()
+    last_err = None
+    for attempt in range(retries + 1):
+        t0 = time.time()
+        try:
+            r = requests.post(
+                f"{OLLAMA_URL}/api/chat",
+                json=body,
+                timeout=(connect_timeout, timeout),
+            )
+            dt = int((time.time() - t0) * 1000)
+            if r.status_code != 200:
+                raise RuntimeError(f"Ollama {r.status_code}: {r.text[:400]}")
+            payload = r.json()
+            # ожидаем {"message": {"content": "..."}}
+            msg = (payload.get("message") or {})
+            content = msg.get("content") or ""
+            if not content:
+                # иногда модель кладёт ответ в top-level "content" (редко)
+                content = payload.get("content") or ""
+            if not content:
+                raise RuntimeError(f"Ollama empty content (dt={dt}ms)")
+            return content
+        except Exception as e:
+            last_err = e
+            print(f"[ollama_client] attempt {attempt+1} failed: {e}", file=sys.stderr)
+            time.sleep(0.2)
+    # если сюда дошли — все попытки провалились
+    raise RuntimeError(f"Ollama error: {last_err}")
+
+def quick_ping(model: Optional[str] = None) -> dict:
+    """
+    Минимальная проверка JSON-режима.
+    """
+    try:
+        out = chat_ollama(
+            system="Ты отвечаешь строго JSON без каких-либо комментариев.",
+            question="Верни {\"ok\": true} ровно в таком виде.",
+            text="",
+            model=model,
+            temperature=0.0,
+            num_predict=16,
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "2048")),
+            use_json_format=True,
+            timeout=30,
+            connect_timeout=3,
+            retries=0,
+        )
+        data = json.loads(out)
+        return {"ok": True, "raw": out[:160], "json": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

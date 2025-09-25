@@ -45,48 +45,24 @@ def health():
 def audit_text_stac(payload: TextIn):
     return audit_stac(payload.text)
 
+
 @app.post("/audit/pdf_stac")
 async def audit_pdf_stac(file: UploadFile = File(...)):
     blob = await file.read()
 
-    # 1) фокус-текст для LLM (ограничим контекст)
-    focus = smart_focus_for_llm(blob)  # учитывает OLLAMA_NUM_CTX, FOCUS_MAX_PAGES, FOCUS_NEIGHBOR из env
-    condensed = focus["focused_text"]
+    focus = smart_focus_for_llm(blob)  # уже ограничивает вход под num_ctx
+    llm_text = focus["focused_text"]
 
-    # 2) если даже фокус большой — чанкнем и сольём результаты
-    MAX_CHARS = int(os.getenv("FOCUS_MAX_CHARS", "14000"))  # ~3500 токенов «верхняя крышка» перед форматированием
-    if len(condensed) > MAX_CHARS:
-        parts = chunk_text(condensed, max_chars=MAX_CHARS, overlap=800)
-        merged = {"passes": [], "violations": [], "chunks": len(parts)}
-        seen = set()
+    full_text = extract_text_from_pdf(blob)  # для детерминированных проверок
+    base_text = full_text if full_text else llm_text
 
-        for idx, part in enumerate(parts, 1):
-            r = audit_stac(part)  # наш существующий пайплайн (LLM+детерминатор)
-            # сольём правила по rule_id
-            for k in ("passes", "violations"):
-                for it in r.get(k, []):
-                    rid = str(it.get("rule_id","")).strip()
-                    key = (k, rid, it.get("evidence",""))
-                    if (k, rid) in seen:
-                        continue
-                    seen.add((k, rid))
-                    merged[k].append(it)
-        return merged
-
-    # 3) обычный путь
-    text_full = extract_text_from_pdf(blob)  # детерминированные проверки используют весь текст
-    # используем audit_stac(condensed_text), но можно прокинуть full_text внутрь, если доработан
-    result = audit_stac(text_full if text_full else condensed)
-    # для отладки — покажем какие страницы выбраны
-
-    result.setdefault("debug_focus", {})["pages_used"] = focus["pages_used"]
-    result["debug_focus"]["token_estimate"] = focus["token_estimate"]
-    result["debug_focus"]["was_reduced"] = focus["was_reduced"]
-    lang = (os.getenv("API_LANG", "ru")).lower()
-    if lang == "ru":
-        result = localize_result(result)
+    result = audit_stac(base_text, llm_text=llm_text)
+    result.setdefault("debug_focus", {}).update({
+        "pages_used": focus["pages_used"],
+        "token_estimate": focus["token_estimate"],
+        "was_reduced": focus["was_reduced"],
+    })
     return result
-
 # опционально: дебаг просмотра сфокусированного текста
 from .focus_text import focus_text
 @app.post("/debug/focus_pdf")
