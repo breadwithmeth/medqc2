@@ -1,86 +1,136 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import json, re
+
+import json
+import re
 
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.I | re.M)
 TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
+
 def _strip_code_fences(s: str) -> str:
     return CODE_FENCE_RE.sub("", s or "").strip()
 
-def _extract_balanced_json(s: str) -> str | None:
+
+def _extract_balanced_json_strict(s: str) -> str | None:
     """
-    Берём самую большую сбалансированную {}-скобочную область.
+    Ищем самую длинную сбалансированную {}-структуру, учитывая строки и экранирование.
     """
-    first = s.find("{")
-    if first < 0:
-        return None
-    stack = 0
-    end = -1
-    for i, ch in enumerate(s[first:], start=first):
-        if ch == "{":
-            stack += 1
-        elif ch == "}":
-            stack -= 1
-            if stack == 0:
-                end = i
-                break
-    if end > first:
-        return s[first:end+1]
-    return None
+    i = 0
+    n = len(s)
+    best = None
+    while i < n:
+        if s[i] == "{":
+            depth = 0
+            j = i
+            in_str = False
+            esc = False
+            while j < n:
+                ch = s[j]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == "\"":
+                        in_str = False
+                else:
+                    if ch == "\"":
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            cand = s[i : j + 1]
+                            if best is None or len(cand) > len(best):
+                                best = cand
+                            break
+                j += 1
+        i += 1
+    return best
+
 
 def _fix_trailing_commas(s: str) -> str:
-    # ", }" или ", ]" -> "}" / "]"
+    # ", }" или ", ]" -> "}" или "]"
     return TRAILING_COMMA_RE.sub(r"\1", s)
 
+
 def _sanitize(s: str) -> str:
-    s = s.replace("\r", "")
-    # убрать невидимые BOM/zero-width
-    s = s.replace("\ufeff", "").replace("\u200b", "")
-    return s
+    return (s or "").replace("\r", "").replace("\ufeff", "").replace("\u200b", "").strip()
+
 
 def coerce_json(raw: str) -> dict:
     """
-    Пытается распарсить ответ модели в dict.
-    1) прямой json.loads
-    2) снять код-блоки и попробовать снова
-    3) вытащить сбалансированный {...}
-    4) поправить висячие запятые
-    Если всё плохо — поднимает ValueError с усечённым фрагментом.
+    Стабильный «ремонтный» парсер ответа LLM → dict.
+    Порядок попыток:
+      1) прямой json.loads
+      2) снять ```json-ограждения
+      3) вырезать самый длинный сбалансированный {...}
+      4) фиксануть висячие запятые
     """
     if not raw:
         raise ValueError("empty LLM content")
+
     txt = _sanitize(raw)
 
-    # 1) строгий парс
     try:
         return json.loads(txt)
     except Exception:
         pass
 
-    # 2) без код-блоков
     txt2 = _strip_code_fences(txt)
     try:
         return json.loads(txt2)
     except Exception:
         pass
 
-    # 3) largest balanced {...}
-    blob = _extract_balanced_json(txt2)
+    blob = _extract_balanced_json_strict(txt2)
     if blob:
         try:
             return json.loads(blob)
         except Exception:
-            # 4) починка висячих запятых
             fixed = _fix_trailing_commas(blob)
             try:
                 return json.loads(fixed)
             except Exception as e:
-                raise ValueError(f"json parse failed after repair: {e}; snippet={fixed[:200]!r}")
+                raise ValueError(f"json parse failed after repair: {e}; snippet={fixed[:220]!r}")
 
-    # крайний случай: ещё раз попробуем убрать висячие запятые из всего текста
     fixed2 = _fix_trailing_commas(txt2)
     try:
         return json.loads(fixed2)
     except Exception as e:
-        raise ValueError(f"json parse failed: {e}; raw_snippet={txt[:200]!r}")
+        raise ValueError(f"json parse failed: {e}; raw_snippet={txt[:220]!r}")
+
+
+def is_likely_truncated_json(txt: str) -> bool:
+    """
+    Грубая эвристика: начинаем с '{', но суммарно скобки не сошлись.
+    Игнорируем символы внутри строк с экранированием.
+    """
+    s = (txt or "").strip()
+    if not s.startswith("{"):
+        return False
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                in_str = False
+        else:
+            if ch == "\"":
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    # нашли закрывающую скобку всего объекта — не обрезан
+                    return False
+    # дошли до конца без depth==0 -> похоже, оборванный
+    return True

@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, sys, time, json
-from typing import Optional, Dict, Any
+
+import json
+import os
+import time
+from typing import Any, Dict, Optional
+
 import requests
 
+# Базовый URL Ollama (GPU-сервер)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
+
 def _join_messages(system: str, question: str, text: str) -> list[dict]:
-    msgs = []
+    msgs: list[dict] = []
     if system:
         msgs.append({"role": "system", "content": system})
-    # чтобы модель видела и вопрос, и текст — кладём в один user-месседж
-    u = question.strip() if question else "Проверь документ по правилам и ответь JSON."
+    u = (question or "").strip() or "Проверь документ и верни требуемый JSON."
     if text:
         u = f"{u}\n\n=== ДОКУМЕНТ ===\n{text}"
     msgs.append({"role": "user", "content": u})
     return msgs
+
 
 def chat_ollama(
     system: str,
@@ -30,13 +36,17 @@ def chat_ollama(
     timeout: int = 180,
     connect_timeout: int = 5,
     retries: int = 1,
+    grammar: Optional[str] = None,
+    json_schema: Optional[dict] = None,
 ) -> str:
     """
-    Возвращает content (str) из /api/chat. При ошибке — поднимает исключение.
+    Универсальный вызов Ollama /api/chat.
+    Приоритет вывода: JSON-Schema > grammar > format=json.
     """
-    model = model or os.getenv("STAC_MODEL", "medaudit:stac-strict")
+    mdl = model or os.getenv("STAC_MODEL", "medaudit:stac-strict")
+
     body: Dict[str, Any] = {
-        "model": model,
+        "model": mdl,
         "messages": _join_messages(system, question, text),
         "options": {
             "temperature": temperature,
@@ -46,57 +56,90 @@ def chat_ollama(
         "keep_alive": keep_alive,
         "stream": False,
     }
-    if use_json_format:
+
+    if json_schema is not None:
+        body["format"] = json_schema
+    elif grammar:
+        body["options"]["grammar"] = grammar
+    elif use_json_format:
         body["format"] = "json"
 
-    last_err = None
-    for attempt in range(retries + 1):
+    last_err: Optional[Exception] = None
+    for _ in range(max(1, retries + 1)):
         t0 = time.time()
         try:
-            r = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json=body,
-                timeout=(connect_timeout, timeout),
-            )
+            r = requests.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=(connect_timeout, timeout))
             dt = int((time.time() - t0) * 1000)
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama {r.status_code}: {r.text[:400]}")
             payload = r.json()
-            # ожидаем {"message": {"content": "..."}}
             msg = (payload.get("message") or {})
-            content = msg.get("content") or ""
-            if not content:
-                # иногда модель кладёт ответ в top-level "content" (редко)
-                content = payload.get("content") or ""
+            content = msg.get("content") or payload.get("content") or ""
             if not content:
                 raise RuntimeError(f"Ollama empty content (dt={dt}ms)")
             return content
         except Exception as e:
             last_err = e
-            print(f"[ollama_client] attempt {attempt+1} failed: {e}", file=sys.stderr)
             time.sleep(0.2)
-    # если сюда дошли — все попытки провалились
     raise RuntimeError(f"Ollama error: {last_err}")
 
-def quick_ping(model: Optional[str] = None) -> dict:
+
+def get_tags(timeout: int = 5, connect_timeout: int = 3) -> dict:
+    r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=(connect_timeout, timeout))
+    r.raise_for_status()
+    return r.json()
+
+
+def schema_smoke_test(timeout: int = 12, connect_timeout: int = 3) -> bool:
     """
-    Минимальная проверка JSON-режима.
+    Проверяет поддержку structured outputs (JSON-Schema) у текущей версии Ollama.
     """
+    body = {
+        "model": os.getenv("STAC_MODEL", "llama3.1:8b-instruct-q4_0"),
+        "messages": [{"role": "user", "content": "schema test"}],
+        "format": {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": False,
+        },
+        "stream": False,
+    }
     try:
-        out = chat_ollama(
-            system="Ты отвечаешь строго JSON без каких-либо комментариев.",
-            question="Верни {\"ok\": true} ровно в таком виде.",
-            text="",
-            model=model,
-            temperature=0.0,
-            num_predict=16,
-            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "2048")),
-            use_json_format=True,
-            timeout=30,
-            connect_timeout=3,
-            retries=0,
-        )
-        data = json.loads(out)
-        return {"ok": True, "raw": out[:160], "json": data}
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=(connect_timeout, timeout))
+        r.raise_for_status()
+        data = r.json()
+        msg = (data.get("message") or {})
+        content = msg.get("content") or ""
+        # Ожидаем {"ok": true}
+        return content.strip().startswith("{") and '"ok"' in content
+    except Exception:
+        return False
+
+
+def quick_ping() -> dict:
+    """
+    Мини-пинг к модели: проверяет доступность и базовый JSON-ответ (через минимальную схему).
+    """
+    ok = False
+    err = ""
+    dt = 0
+    try:
+        t0 = time.time()
+        body = {
+            "model": os.getenv("STAC_MODEL", "llama3.1:8b-instruct-q4_0"),
+            "messages": [{"role": "user", "content": "ping"}],
+            "format": {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
+            "stream": False,
+        }
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=(5, 12))
+        dt = int((time.time() - t0) * 1000)
+        r.raise_for_status()
+        payload = r.json()
+        msg = (payload.get("message") or {})
+        content = msg.get("content") or ""
+        ok = content.strip().startswith("{") and '"ok"' in content
+        return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", "")}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        err = f"{type(e).__name__}: {e}"
+        return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", ""), "error": err}
