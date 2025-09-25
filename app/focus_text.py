@@ -18,21 +18,21 @@ HEADINGS = [
 
 def focus_text(text: str) -> str:
     num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "3072"))
-    out_budget = int(os.getenv("OUTPUT_BUDGET_TOKENS", "140"))
-    system_budget = int(os.getenv("SYSTEM_BUDGET_TOKENS", "650"))
+    out_budget = int(os.getenv("OUTPUT_BUDGET_TOKENS", "200"))
+    system_budget = int(os.getenv("SYSTEM_BUDGET_TOKENS", "700"))
     max_input_tokens = max(512, num_ctx - out_budget - system_budget)
     max_chars = int(max_input_tokens * AVG_CHARS_PER_TOKEN)
 
-    t = text
-    blocks = [t[:5000]]  # больше шапки — тут обычно прием, первые осмотры и сроки
+    t = text or ""
+    blocks = [t[:6000]]
     low = t.lower()
     for rx in HEADINGS:
         m = re.search(rx, low)
         if not m: continue
-        i = max(0, m.start() - 1400)
-        j = min(len(t), m.start() + 3200)
+        i = max(0, m.start() - 1600)
+        j = min(len(t), m.start() + 3400)
         blocks.append(t[i:j])
-    blocks.append(t[-3000:])  # хвост — эпикризы/рекомендации
+    blocks.append(t[-3500:])
 
     seen, out, total = set(), [], 0
     for b in blocks:
@@ -42,5 +42,4 @@ def focus_text(text: str) -> str:
         take = min(len(b), max(0, max_chars - total))
         if take <= 0: break
         out.append(b[:take]); total += take
-    focused = "\n\n".join(out)
-    return focused[:max_chars]
+    return ("\n\n".join(out))[:max_chars]

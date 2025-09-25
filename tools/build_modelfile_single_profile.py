@@ -1,67 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-build_modelfile_single_profile.py
----------------------------------
-Собирает ОДИН Modelfile для Ollama с зашитыми в SYSTEM правилами,
-отфильтрованными по префиксам (например, GEN, STAC).
-
-Пример использования:
-  python3 tools/build_modelfile_single_profile.py Modelfile.stac.strict rules_all.yaml \
-    --base llama3.1:8b-instruct-q5_1 \
-    --name medaudit:stac-strict \
-    --num_ctx 3072 \
-    --include GEN STAC
-
-После генерации Modelfile создайте модель:
-  ollama create medaudit:stac-strict -f Modelfile.stac.strict
-"""
-
 from __future__ import annotations
-import argparse
-import re
+import argparse, re
 from pathlib import Path
 from textwrap import dedent
-
-try:
-    import yaml  # pip install pyyaml
-except Exception as e:
-    raise SystemExit("Требуется PyYAML: pip install pyyaml") from e
-
+import yaml
 
 def oneline(s: str) -> str:
-    """Сжать многострочный текст в одну строку с одиночными пробелами."""
     s = (s or "").strip()
     return re.sub(r"\s+", " ", s)
 
-
 def filter_rules(rules: list[dict], include: list[str]) -> list[dict]:
-    """
-    Оставить только правила, чей префикс (часть до первого '-') входит в include.
-    Пример: id="STAC-27-..." -> префикс "STAC".
-    """
     inc = {p.upper() for p in include}
-    out: list[dict] = []
+    out = []
     for r in rules or []:
         rid = str(r.get("id", "")).strip()
-        if not rid:
-            continue
+        if not rid: continue
         pref = (rid.split("-", 1)[0] if "-" in rid else rid).upper()
-        if pref in inc:
-            out.append(r)
+        if pref in inc: out.append(r)
     return out
 
-
 def build_system_instructions(rules: list[dict]) -> str:
-    """
-    Строгий SYSTEM:
-    - Сначала TАЙМЛАЙН (ключевые даты/время/факты с цитатами),
-    - 100% покрытие правил (каждое правило попадает либо в passes, либо в violations),
-    - FAIL по умолчанию при отсутствии данных,
-    - assessed_rule_ids для контроля количества.
-    """
     TOTAL = len(rules)
-
     header = dedent(f"""\
     Ты — строгий аудитор медицинских документов Республики Казахстан.
     Работай по стационарному профилю (GEN+STAC) и правилам ниже.
@@ -70,7 +30,7 @@ def build_system_instructions(rules: list[dict]) -> str:
     • Если требуемая сущность/дата/время/подпись не найдены — это FAIL (по умолчанию FAIL при отсутствии).
     • Сначала сформируй ТАЙМЛАЙН (timeline) — извлеки ключевые даты/время/факты и дай короткие ДОСЛОВНЫЕ цитаты.
     • 3-и сутки = 72 часа от момента поступления. Рабочее время заведующего (если явно не указано иное): будни 09:00–18:00.
-    • Для ограничений во времени (например, «30 минут») сравни реальные метки времени.
+    • Для ограничений по времени (например, «30 минут») сравни реальные метки времени.
     • НЕ придумывай данные; evidence — только короткие цитаты из документа.
     • Оцени КАЖДОЕ правило из списка ниже. Сумма PASS+FAIL ДОЛЖНА быть ровно {TOTAL}.
       Если по правилу нет явной цитаты — помести его в violations с evidence: "не найдено в документе".
@@ -112,8 +72,7 @@ def build_system_instructions(rules: list[dict]) -> str:
     Никаких пояснений вне JSON.
     """).strip()
 
-    # Компактный список правил одной строкой — часть SYSTEM
-    lines: list[str] = []
+    lines = []
     for r in rules:
         rid   = oneline(r.get("id", ""))
         title = oneline(r.get("title", ""))
@@ -128,19 +87,14 @@ def build_system_instructions(rules: list[dict]) -> str:
     Алгоритм:
     1) Сформируй timeline (с дословными цитатами).
     2) Пройди по всем {TOTAL} правилам: каждое правило положи либо в passes, либо в violations (нельзя пропускать).
-    3) Если чего-то нет в документе — правило идёт в violations с evidence "не найдено в документе" или короткой цитатой.
+    3) Если чего-то нет в документе — правило в violations с evidence "не найдено в документе" или короткой цитатой.
     4) Заполни assessed_rule_ids всеми {TOTAL} идентификаторами правил в порядке оценки.
     5) Верни ТОЛЬКО JSON по схеме.
     """).strip()
 
     return f"{header}\n\nПРАВИЛА:\n" + "\n".join(lines) + "\n\n" + tail
 
-
 def build_modelfile(base: str, num_ctx: int, system: str) -> str:
-    """
-    Формирует текст Modelfile: FROM + PARAMETER num_ctx + SYSTEM \"\"\"...\"\"\".
-    Экранируем тройные кавычки, чтобы не сломать Modelfile.
-    """
     system_escaped = system.replace('"""', '\\"""')
     return dedent(f"""\
     FROM {base}
@@ -148,45 +102,27 @@ def build_modelfile(base: str, num_ctx: int, system: str) -> str:
     SYSTEM \"\"\"{system_escaped}\"\"\"
     """).lstrip()
 
-
 def main():
-    ap = argparse.ArgumentParser(description="Собрать ОДИН Modelfile для выбранного профиля (prefix include).")
-    ap.add_argument("out_modelfile", help="Путь для Modelfile (например, Modelfile.stac.strict)")
-    ap.add_argument("rules_yaml", help="YAML с полным набором правил (корневой ключ 'rules')")
-    ap.add_argument("--base", default="llama3.1:8b-instruct-q5_1", help="Базовая квантованная модель Ollama")
-    ap.add_argument("--name", default="medaudit:stac-strict", help="Имя модели для 'ollama create'")
-    ap.add_argument("--num_ctx", type=int, default=3072, help="Контекст модели (num_ctx)")
-    ap.add_argument("--include", nargs="+", default=["GEN", "STAC"], help="Список префиксов правил для включения")
+    ap = argparse.ArgumentParser(description="Собрать Modelfile (prefix include).")
+    ap.add_argument("out_modelfile")
+    ap.add_argument("rules_yaml")
+    ap.add_argument("--base", default="llama3.1:8b-instruct-q5_1")
+    ap.add_argument("--name", default="medaudit:stac-strict")
+    ap.add_argument("--num_ctx", type=int, default=3072)
+    ap.add_argument("--include", nargs="+", default=["GEN","STAC"])
     args = ap.parse_args()
 
-    rules_path = Path(args.rules_yaml)
-    if not rules_path.exists():
-        raise SystemExit(f"Не найден файл правил: {rules_path}")
-
-    try:
-        data = yaml.safe_load(rules_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise SystemExit(f"Не удалось прочитать YAML {rules_path}: {e}") from e
-
-    if not isinstance(data, dict) or "rules" not in data:
-        raise SystemExit("В YAML ожидается корневой ключ 'rules' со списком правил.")
-
-    rules_all = data["rules"]
-    if not isinstance(rules_all, list) or not rules_all:
-        raise SystemExit("Список 'rules' пуст или имеет неверный формат.")
-
+    data = yaml.safe_load(Path(args.rules_yaml).read_text(encoding="utf-8"))
+    rules_all = data.get("rules", [])
     chosen = filter_rules(rules_all, args.include)
     if not chosen:
-        raise SystemExit(f"По префиксам {args.include} правил не найдено.")
+        raise SystemExit(f"Нет правил по префиксам {args.include}")
 
     system = build_system_instructions(chosen)
-    modelfile_text = build_modelfile(args.base, args.num_ctx, system)
-
     out_path = Path(args.out_modelfile)
-    out_path.write_text(modelfile_text, encoding="utf-8")
-    print(f"OK: Modelfile записан -> {out_path}")
+    out_path.write_text(build_modelfile(args.base, args.num_ctx, system), encoding="utf-8")
+    print(f"OK: Modelfile -> {out_path}")
     print(f"Создать модель:\n  ollama create {args.name} -f {out_path}")
-
 
 if __name__ == "__main__":
     main()
