@@ -1,6 +1,9 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-requests==2.32.3
-pymupdf==1.24.10
-pdfminer.six==20231228
-pypdf==5.0.1
+fastapi
+uvicorn[standard]
+python-multipart
+pymupdf
+pdfminer.six
+pillow
+pytesseract
+requests
+pyyaml

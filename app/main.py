@@ -5,6 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from .pdf_text import extract_text_from_pdf
 from .audit_engine_stac import audit_stac
+from .timeline_extractor import extract_timeline
+from .audit_engine_stac import audit_stac
+from .pdf_smart_reader import smart_focus_for_llm, chunk_text
+from .pdf_ocr_fallback import has_tesseract
+from .localize import localize_result
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","*").split(",") if o.strip()]
 
@@ -43,8 +48,44 @@ def audit_text_stac(payload: TextIn):
 @app.post("/audit/pdf_stac")
 async def audit_pdf_stac(file: UploadFile = File(...)):
     blob = await file.read()
-    text = extract_text_from_pdf(blob)
-    return audit_stac(text)
+
+    # 1) фокус-текст для LLM (ограничим контекст)
+    focus = smart_focus_for_llm(blob)  # учитывает OLLAMA_NUM_CTX, FOCUS_MAX_PAGES, FOCUS_NEIGHBOR из env
+    condensed = focus["focused_text"]
+
+    # 2) если даже фокус большой — чанкнем и сольём результаты
+    MAX_CHARS = int(os.getenv("FOCUS_MAX_CHARS", "14000"))  # ~3500 токенов «верхняя крышка» перед форматированием
+    if len(condensed) > MAX_CHARS:
+        parts = chunk_text(condensed, max_chars=MAX_CHARS, overlap=800)
+        merged = {"passes": [], "violations": [], "chunks": len(parts)}
+        seen = set()
+
+        for idx, part in enumerate(parts, 1):
+            r = audit_stac(part)  # наш существующий пайплайн (LLM+детерминатор)
+            # сольём правила по rule_id
+            for k in ("passes", "violations"):
+                for it in r.get(k, []):
+                    rid = str(it.get("rule_id","")).strip()
+                    key = (k, rid, it.get("evidence",""))
+                    if (k, rid) in seen:
+                        continue
+                    seen.add((k, rid))
+                    merged[k].append(it)
+        return merged
+
+    # 3) обычный путь
+    text_full = extract_text_from_pdf(blob)  # детерминированные проверки используют весь текст
+    # используем audit_stac(condensed_text), но можно прокинуть full_text внутрь, если доработан
+    result = audit_stac(text_full if text_full else condensed)
+    # для отладки — покажем какие страницы выбраны
+
+    result.setdefault("debug_focus", {})["pages_used"] = focus["pages_used"]
+    result["debug_focus"]["token_estimate"] = focus["token_estimate"]
+    result["debug_focus"]["was_reduced"] = focus["was_reduced"]
+    lang = (os.getenv("API_LANG", "ru")).lower()
+    if lang == "ru":
+        result = localize_result(result)
+    return result
 
 # опционально: дебаг просмотра сфокусированного текста
 from .focus_text import focus_text
@@ -53,3 +94,31 @@ async def debug_focus(file: UploadFile = File(...)):
     blob = await file.read()
     txt = extract_text_from_pdf(blob)
     return {"raw_len": len(txt), "focused_len": len(focus_text(txt)), "focused_head": focus_text(txt)[:1200]}
+
+
+from .timeline_extractor import extract_timeline
+
+@app.post("/debug/timeline_pdf")
+async def debug_timeline(file: UploadFile = File(...)):
+    blob = await file.read()
+    text = extract_text_from_pdf(blob)
+    tl = extract_timeline(text)
+    # компактный вывод
+    keys = ["admission_dt_str","er_exam_dt_str","ward_exam_dt_str","head_primary_dt_str",
+            "diag_justify_dt_str","anes_protocol_dt_str","op_protocol_dt_str",
+            "clinical_diag_dt_str","stage_epicrisis_dt_str","note_times","severe_present"]
+    out = {k: tl.get(k) for k in keys}
+    return out
+
+
+@app.post("/debug/ocr_check")
+async def debug_ocr(file: UploadFile = File(...)):
+    blob = await file.read()
+    focus = smart_focus_for_llm(blob)
+    return {
+        "tesseract_available": has_tesseract(),
+        "pages_used": focus["pages_used"],
+        "token_estimate": focus["token_estimate"],
+        "was_reduced": focus["was_reduced"],
+        "focused_head": focus["focused_text"][:400]
+    }
