@@ -143,3 +143,31 @@ def quick_ping() -> dict:
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", ""), "error": err}
+
+
+def grammar_smoke_test(timeout: int = 12, connect_timeout: int = 3) -> bool:
+    """
+    Быстрая проверка поддержки grammar: навязываем минимальный JSON {"ok": true}.
+    Если сервер/модель игнорирует grammar, вернётся произвольный текст.
+    """
+    GRAMMAR = r'''
+root ::= ws obj ws
+obj  ::= "{" ws "\"ok\"" ws ":" ws "true" ws "}"
+ws   ::= ([ \t\n\r])*
+'''
+    body = {
+        "model": os.getenv("STAC_MODEL", "llama3.1:8b-instruct-q4_0"),
+        "messages": [{"role": "user", "content": "grammar test"}],
+        "options": {"grammar": GRAMMAR},
+        "stream": False,
+    }
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=(connect_timeout, timeout))
+        r.raise_for_status()
+        data = r.json()
+        msg = (data.get("message") or {})
+        content = msg.get("content") or ""
+        s = content.strip()
+        return s.startswith("{") and '"ok"' in s and 'true' in s
+    except Exception:
+        return False

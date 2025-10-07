@@ -29,10 +29,13 @@ def validate_stac_det(tl: Dict[str, Any], full_text: str | None = None) -> Dict[
         kind, item = res
         (passes if kind=="pass" else violations).append(item)
 
+    def yn(v) -> str:
+        return "да" if bool(v) else "нет"
+
     # 1) ≤30 мин ER→Ward
     if tl.get("er_exam_dt") or tl.get("ward_exam_dt"):
         ok = within_minutes(tl.get("er_exam_dt"), tl.get("ward_exam_dt"), 30)
-        ev = f"ER:{fmt(tl.get('er_exam_dt'))} → Ward:{fmt(tl.get('ward_exam_dt'))}"
+        ev = f"Приёмное:{fmt(tl.get('er_exam_dt'))} → Отделение:{fmt(tl.get('ward_exam_dt'))}"
         add(_v("STAC-27-ER-WARD-EXAM-30MIN", "Осмотр отделения ≤30 мин при экстренной",
                "приёмное/отделение", bool(ok), ev))
 
@@ -46,7 +49,7 @@ def validate_stac_det(tl: Dict[str, Any], full_text: str | None = None) -> Dict[
             head_role_ok = bool(re.search(r"заведующ", blk, re.I))
     ok_head = head_time_ok and head_role_ok
     add(_v("STAC-27-HEAD-PRIMARY-D0", "Первичный осмотр Заведующим в рабочее время",
-           "первичный осмотр", ok_head, f"time_ok:{head_time_ok} role_ok:{head_role_ok} dt:{fmt(tl.get('head_primary_dt'))}"))
+           "первичный осмотр", ok_head, f"раб. время:{yn(head_time_ok)} заведующий:{yn(head_role_ok)} время:{fmt(tl.get('head_primary_dt'))}"))
 
     # 3) Обоснование диагноза ≤3 суток
     if tl.get("admission_dt") and tl.get("diag_justify_dt"):
@@ -64,9 +67,9 @@ def validate_stac_det(tl: Dict[str, Any], full_text: str | None = None) -> Dict[
                   pre.get("has_anamnesis_vitae"),
                   pre.get("has_anamnesis_morbi"),
                   pre.get("has_somatic_status")])
-        ev = (f"Индик:{pre.get('has_indications')} Жал:{pre.get('has_complaints')} "
-              f"АЖ:{pre.get('has_anamnesis_vitae')} АЗ:{pre.get('has_anamnesis_morbi')} "
-              f"Статус:{pre.get('has_somatic_status')}")
+        ev = (f"показания:{yn(pre.get('has_indications'))} жалобы:{yn(pre.get('has_complaints'))} "
+              f"анамнез жизни:{yn(pre.get('has_anamnesis_vitae'))} анамнез болезни:{yn(pre.get('has_anamnesis_morbi'))} "
+              f"соматический статус:{yn(pre.get('has_somatic_status'))}")
         add(_v("STAC-27-PREOP-EPICRISIS-CONTENT", "Предоперационный эпикриз — полнота",
                "предоперационный эпикриз", ok, ev))
 
@@ -83,9 +86,9 @@ def validate_stac_det(tl: Dict[str, Any], full_text: str | None = None) -> Dict[
             op.get("nurse"),
             op.get("surgeon")
         ])
-        ev = (f"AB:{op.get('ab_prophylaxis')} pre/post:{op.get('pre_diag')}/{op.get('post_diag')} "
-              f"op:{op.get('op_name')} blood:{op.get('blood_loss_ml')} "
-              f"A/N/S:{op.get('anesthesiologist')}/{op.get('nurse')}/{op.get('surgeon')}")
+        ev = (f"АБ-профилактика:{yn(op.get('ab_prophylaxis'))} до/после:{yn(op.get('pre_diag'))}/{yn(op.get('post_diag'))} "
+              f"операция:{yn(op.get('op_name'))} кровопотеря (мл):{op.get('blood_loss_ml')} "
+              f"Анестезиолог/медсестра/хирург:{yn(op.get('anesthesiologist'))}/{yn(op.get('nurse'))}/{yn(op.get('surgeon'))}")
         add(_v("STAC-27-OP-PROTOCOL-FIELDS", "Протокол операции — обязательные поля",
                "операционный протокол", ok, ev, severity="critical"))
 
@@ -102,15 +105,15 @@ def validate_stac_det(tl: Dict[str, Any], full_text: str | None = None) -> Dict[
         if full_text:
             has_post = bool(re.search(r"(послеоперационн\w*\s+дневник)", full_text, re.I))
         add(_v("STAC-27-POSTOP-NOTE", "Послеоперационный дневник — наличие",
-               "послеоперационный дневник", has_post, f"операция есть → дневник:{has_post}"))
+               "послеоперационный дневник", has_post, f"операция есть → дневник:{yn(has_post)}"))
 
     # 8) Предтрансфузионный эпикриз — параметры
     tr = tl.get("transfusion_pre") or {}
     if tr.get("exists"):
         ok = all([tr.get("cbc_dt"), tr.get("abg_dt"), tr.get("pulse"),
                   tr.get("bp"), tr.get("spo2"), tr.get("hb")])
-        ev = (f"OAK:{tr.get('cbc_dt')} KЩC:{tr.get('abg_dt')} "
-              f"P/BP/SpO2/Hb:{tr.get('pulse')}/{tr.get('bp')}/{tr.get('spo2')}/{tr.get('hb')}")
+        ev = (f"ОАК:{yn(tr.get('cbc_dt'))} КЩС:{yn(tr.get('abg_dt'))} "
+              f"Пульс/АД/SpO₂/Hb:{yn(tr.get('pulse'))}/{yn(tr.get('bp'))}/{yn(tr.get('spo2'))}/{yn(tr.get('hb'))}")
         add(_v("STAC-27-TRANSFUSION-PRE-EPICRISIS", "Предтрансфузионный эпикриз — параметры",
                "предтрансфузионный эпикриз", ok, ev, severity="critical"))
 
@@ -118,7 +121,7 @@ def validate_stac_det(tl: Dict[str, Any], full_text: str | None = None) -> Dict[
     cpr = tl.get("cpr") or {}
     if cpr.get("present"):
         ok = (cpr.get("duration_min", 0) >= 30) and bool(cpr.get("every_5_min_checks"))
-        ev = f"Длительность:{cpr.get('duration_min')}; каждые 5 мин:{cpr.get('every_5_min_checks')}"
+        ev = f"Длительность (мин):{cpr.get('duration_min')}; контроль каждые 5 мин:{yn(cpr.get('every_5_min_checks'))}"
         add(_v("STAC-27-CPR-LOG-30MIN", "СЛР — ≥30 мин, контроль каждые 5 мин",
                "реанимация/дневники", ok, ev, severity="critical"))
 

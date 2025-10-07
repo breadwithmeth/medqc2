@@ -137,7 +137,12 @@ COMPACT_AUDIT_SCHEMA = {
     "type": "object",
     "properties": {
         "viol": {"type": "array", "items": COMPACT_ITEM_SCHEMA, "maxItems": LIMIT_ITEMS, "uniqueItems": True},
-        "assessed": {"type": "array", "items": {"type": "string", "enum": RULE_ID_ENUM}, "uniqueItems": True},
+        "assessed": {
+            "type": "array",
+            "items": {"type": "string", "enum": RULE_ID_ENUM},
+            "uniqueItems": True,
+            "minItems": 1
+        },
     },
     "required": ["viol", "assessed"],
     "additionalProperties": False,

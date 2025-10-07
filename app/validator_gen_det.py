@@ -17,6 +17,9 @@ def validate_gen_det(g: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         kind, item = res
         (passes if kind=="pass" else violations).append(item)
 
+    def yn(v) -> str:
+        return "да" if bool(v) else "нет"
+
     # GEN-IDENT-HEADER
     ok = all([
         bool(g.get("fio_line")),
@@ -27,7 +30,11 @@ def validate_gen_det(g: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         bool(g.get("org_present")),
         bool(g.get("admission_dt_str")),
     ])
-    ev = f"FIO:{bool(g.get('fio_line'))} DOB/AGE:{bool(g.get('dob_or_age'))} SEX:{bool(g.get('sex'))} IIN:{bool(g.get('iin'))} №ист:{bool(g.get('hist_no'))} МО:{g.get('org_present')} Поступл:{bool(g.get('admission_dt_str'))} Выписка:{bool(g.get('discharge_dt_str'))}"
+    ev = (
+        f"ФИО:{yn(g.get('fio_line'))} ДР/возраст:{yn(g.get('dob_or_age'))} Пол:{yn(g.get('sex'))} "
+        f"ИИН:{yn(g.get('iin'))} №ист:{yn(g.get('hist_no'))} МО:{yn(g.get('org_present'))} "
+        f"Поступл:{yn(g.get('admission_dt_str'))} Выписка:{yn(g.get('discharge_dt_str'))}"
+    )
     add(_v("GEN-IDENT-HEADER","Шапка — идентификация пациента и МО","шапка/первая страница", ok, ev))
 
     # GEN-DATES-CONSISTENT (простая проверка: выписка после поступления)
@@ -46,7 +53,7 @@ def validate_gen_det(g: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     c = g.get("consents") or {}
     ok3 = (c.get("count",0) > 0 and c.get("with_sign",0) >= 1 and c.get("with_date",0) >= 1)
     ev3 = f"всего:{c.get('count',0)} подпись:{c.get('with_sign',0)} дата:{c.get('with_date',0)}"
-    add(_v("GEN-CONSENTS","Информированные согласия — есть подписи и даты","согласия/приложения", ok3, ev3))
+    add(_v("GEN-CONSENT","Информированные согласия — есть подписи и даты","согласия/приложения", ok3, ev3))
 
     # GEN-LABS-DATED
     add(_v("GEN-LABS-DATED","Анализы/исследования — с датами","диагностика", g.get("labs_with_dates",0) > 0, f"с датами: {g.get('labs_with_dates',0)}", severity="minor"))
@@ -57,13 +64,20 @@ def validate_gen_det(g: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     # GEN-DISCHARGE-SUMMARY
     ds = g.get("discharge_struct") or {}
     ok4 = all([ds.get("has_title"), ds.get("has_diag"), ds.get("has_treat"), ds.get("has_recom")])
-    ev4 = f"title:{ds.get('has_title')} diag:{ds.get('has_diag')} just:{ds.get('has_just')} treat:{ds.get('has_treat')} outcome:{ds.get('has_outcome')} recom:{ds.get('has_recom')} regimen:{ds.get('has_regimen')} diet:{ds.get('has_diet')} follow:{ds.get('has_follow')}"
+    ev4 = (
+        f"заголовок:{yn(ds.get('has_title'))} диагноз:{yn(ds.get('has_diag'))} обоснование:{yn(ds.get('has_just'))} "
+        f"лечение:{yn(ds.get('has_treat'))} исход:{yn(ds.get('has_outcome'))} рекомендации:{yn(ds.get('has_recom'))} "
+        f"режим:{yn(ds.get('has_regimen'))} диета:{yn(ds.get('has_diet'))} контроль:{yn(ds.get('has_follow'))}"
+    )
     add(_v("GEN-DISCHARGE-SUMMARY","Выписной эпикриз — структура","выписной эпикриз", ok4, ev4))
 
     # GEN-MEDS-AT-DISCHARGE
     md = g.get("meds_at_discharge") or {}
     ok5 = (md.get("has_any") and md.get("has_dose") and md.get("has_freq") and md.get("has_duration"))
-    ev5 = f"any:{md.get('has_any')} dose:{md.get('has_dose')} freq:{md.get('has_freq')} dur:{md.get('has_duration')}"
+    ev5 = (
+        f"есть назначения:{yn(md.get('has_any'))} доза:{yn(md.get('has_dose'))} "
+        f"кратность:{yn(md.get('has_freq'))} срок:{yn(md.get('has_duration'))}"
+    )
     add(_v("GEN-MEDS-AT-DISCHARGE","Препараты при выписке — доза/кратность/срок","рекомендации", ok5, ev5, severity="minor"))
 
     return {"passes": passes, "violations": violations}

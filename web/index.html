@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MedAudit — проверка PDF</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>MedAudit KZ</h1>
+    <p>Проверьте мед. документ (PDF) на соответствие правилам. Бэкенд: <code id="apiBase"></code></p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <label class="file-label">
+        <input type="file" id="file" accept="application/pdf" />
+        <span>Выберите PDF…</span>
+      </label>
+      <div class="opts">
+        <label>
+          <input type="checkbox" id="human" checked /> Читаемый отчёт (human)
+        </label>
+        <label>
+          Формат:
+          <select id="format">
+            <option value="json">json</option>
+            <option value="text">text</option>
+            <option value="markdown">markdown</option>
+          </select>
+        </label>
+        <button id="run">Аудит</button>
+      </div>
+      <div class="hint">
+        <small>Подсказка: API отображается в <a href="/docs" target="_blank">Swagger UI</a>.</small>
+      </div>
+    </section>
+
+    <section class="result">
+      <h2>Результат</h2>
+      <div class="actions">
+        <button id="dlJson" disabled>Скачать JSON</button>
+        <button id="dlMd" disabled>Скачать Markdown</button>
+      </div>
+      <pre id="out" class="code"></pre>
+    </section>
+
+    <section class="violations" id="violBox" hidden>
+      <h2>Нарушения</h2>
+      <ul id="violList"></ul>
+    </section>
+
+    <section class="diag" id="diagBox" hidden>
+      <h2>Диагностика LLM</h2>
+      <div id="diag"></div>
+      <div id="assessed"></div>
+    </section>
+  </main>
+
+  <footer>
+    <small>
+      MedAudit KZ • <a href="/ui" target="_blank">/ui</a> • <a href="/redoc" target="_blank">/redoc</a>
+    </small>
+  </footer>
+
+  <script>window.API_BASE = location.origin</script>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

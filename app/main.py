@@ -4,14 +4,17 @@ from __future__ import annotations
 import os
 import time
 
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, File, UploadFile, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from .audit_engine_stac import audit_stac
-from .ollama_client import quick_ping, get_tags, schema_smoke_test
+from .ollama_client import quick_ping, get_tags, schema_smoke_test, grammar_smoke_test
 from .pdf_smart_reader import smart_focus_for_llm
 from .pdf_text import extract_text_from_pdf
+from .humanize import build_human_report
+from .localize import localize_result
 
 
 APP_TITLE = "medqc2"
@@ -27,6 +30,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Static UI (simple front)
+try:
+    app.mount("/ui", StaticFiles(directory="web", html=True), name="ui")
+except Exception:
+    # папка может отсутствовать в некоторых окружениях — игнорируем
+    pass
 
 
 # измерение времени запроса
@@ -39,7 +48,11 @@ async def timing_mw(request: Request, call_next):
 
 
 @app.post("/audit/pdf_stac")
-async def audit_pdf_stac(file: UploadFile = File(...)):
+async def audit_pdf_stac(
+    file: UploadFile = File(...),
+    human: bool = Query(False, description="Человекочитаемый компактный ответ"),
+    format: str = Query("json", description="Формат человека: json|text|markdown", regex="^(json|text|markdown)$"),
+):
     blob = await file.read()
 
     # 1) фокусированный текст для LLM (ограничивает вход под num_ctx)
@@ -58,7 +71,15 @@ async def audit_pdf_stac(file: UploadFile = File(...)):
             "was_reduced": focus.get("was_reduced"),
         }
     )
-    return JSONResponse(result)
+    if human:
+        report = build_human_report(result)
+        if format == "json":
+            return JSONResponse(report)
+        # text or markdown — вернём простой текст (markdown совместим в большинстве UI)
+        return PlainTextResponse(report["pretty_text"], media_type="text/markdown" if format == "markdown" else "text/plain")
+
+    # По умолчанию возвращаем локализованный JSON (на русском)
+    return JSONResponse(localize_result(result))
 
 
 # ---------- DEBUG ----------
@@ -95,6 +116,15 @@ def dbg_schema():
         return {"schema_supported": bool(ok)}
     except Exception as e:
         return JSONResponse({"schema_supported": False, "error": str(e)}, status_code=502)
+
+
+@app.get("/debug/ollama/grammar")
+def dbg_grammar():
+    try:
+        ok = grammar_smoke_test()
+        return {"grammar_supported": bool(ok)}
+    except Exception as e:
+        return JSONResponse({"grammar_supported": False, "error": str(e)}, status_code=502)
 
 
 @app.get("/debug/llm_ping")
