@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from .ollama_client import chat_ollama, schema_smoke_test, grammar_smoke_test
 from .gbnf import COMPACT_AUDIT_GBNF
@@ -104,7 +104,7 @@ def _chunk_schema(rules_this_chunk: List[str], ev_max: int, limit_items: int) ->
     }
 
 # ---------- основной аудит ----------
-def audit_stac(text: str, llm_text: str | None = None) -> dict:
+def audit_stac(text: str, llm_text: str | None = None, model: Optional[str] = None) -> dict:
     """
     Единый аудит стационара: детерминированные проверки + LLM (чанки, компактный JSON).
     """
@@ -125,7 +125,8 @@ def audit_stac(text: str, llm_text: str | None = None) -> dict:
     condensed = llm_text if llm_text is not None else focus_text(text)
 
     # 3) LLM выключаем по окружению
-    llm_status: Dict[str, Any] = {"ok": False, "model": STAC_MODEL, "duration_ms": 0, "bytes": 0, "error": "not-called"}
+    model_used = model or os.getenv("STAC_MODEL", STAC_MODEL)
+    llm_status: Dict[str, Any] = {"ok": False, "model": model_used, "duration_ms": 0, "bytes": 0, "error": "not-called"}
     if os.getenv("SKIP_LLM", "0") == "1":
         llm_status["error"] = "skipped by env (SKIP_LLM=1)"
         result["llm_status"] = llm_status
@@ -182,19 +183,20 @@ def audit_stac(text: str, llm_text: str | None = None) -> dict:
     rules_per_chunk: List[List[str]] = []
     parse_errors = 0
     assessed_weak_chunks = 0
-    for rules_this_chunk in chunks:
-        rules_per_chunk.append(list(rules_this_chunk))
+    retry_used = False
+    retry_stats: Dict[str, Any] = {}
+
+    def _call_chunk(rules_this_chunk: List[str], num_predict_override: int | None = None, model_override: str | None = None):
         q = _compact_question(rules_this_chunk, LIMIT_ITEMS, EV_MAX)
         t0 = time.time()
-        # динамическая схема под чанк (если выбран режим schema)
         per_chunk_schema = _chunk_schema(rules_this_chunk, EV_MAX, LIMIT_ITEMS) if chosen_mode == "schema" else None
         raw = chat_ollama(
             system="Ты строгий аудитор медицинских документов РК. Возвращай только валидный JSON по заданной схеме, без какого-либо текста вне JSON.",
             question=q,
             text=condensed,
-            model=STAC_MODEL,
+            model=(model_override or model_used),
             temperature=0.0,
-            num_predict=NUM_PREDICT,
+            num_predict=(num_predict_override or NUM_PREDICT),
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "3072")),
             keep_alive=os.getenv("KEEP_ALIVE", "30m"),
             use_json_format=(chosen_mode == "json"),
@@ -205,6 +207,11 @@ def audit_stac(text: str, llm_text: str | None = None) -> dict:
             json_schema=(per_chunk_schema if chosen_mode == "schema" else None),
         )
         dt = int((time.time() - t0) * 1000)
+        return raw, dt
+
+    for rules_this_chunk in chunks:
+        rules_per_chunk.append(list(rules_this_chunk))
+        raw, dt = _call_chunk(rules_this_chunk)
         total_ms += dt
         total_bytes += len(raw.encode("utf-8"))
         if len(raw_samples) < SAMPLES_MAX:
@@ -219,6 +226,56 @@ def audit_stac(text: str, llm_text: str | None = None) -> dict:
             # если распарсить не удалось — считаем, что нарушений нет, assessed заполним фолбэком
             parse_errors += 1
             data = {"viol": [], "assessed": []}
+
+        # Если мы в json-режиме и видим пустой/слабый assessed — сделаем одну строгую повторную попытку с урезанным чанком
+        need_retry = False
+        assessed_list_probe = data.get("assessed", []) or []
+        valid_probe = [rid for rid in assessed_list_probe if rid in rules_this_chunk]
+        if chosen_mode == "json" and (not assessed_list_probe or len(set(valid_probe)) < max(1, len(rules_this_chunk)//2)):
+            need_retry = True
+        if need_retry and not retry_used:
+            retry_used = True
+            # разобъём текущий чанк пополам и попробуем снова с меньшим num_predict
+            mid = max(1, len(rules_this_chunk)//2)
+            small_chunks = [rules_this_chunk[:mid], rules_this_chunk[mid:]]
+            retry_hits = 0
+            retry_ms = 0
+            retry_bytes = 0
+            combined_assessed: set[str] = set()
+            combined_viol: Dict[str, Dict[str, Any]] = {}
+            for sub in small_chunks:
+                raw2, dt2 = _call_chunk(sub, num_predict_override=max(256, NUM_PREDICT//2))
+                retry_ms += dt2
+                retry_bytes += len(raw2.encode("utf-8"))
+                try:
+                    data2 = coerce_json(raw2)
+                except Exception:
+                    data2 = {"viol": [], "assessed": []}
+                al2 = data2.get("assessed", []) or []
+                if not al2:
+                    al2 = list(sub)
+                for rid in al2:
+                    if rid in sub:
+                        combined_assessed.add(rid)
+                for v in data2.get("viol", []) or []:
+                    rid = v.get("r", "")
+                    if rid and rid in sub and rid not in combined_viol:
+                        combined_viol[rid] = {
+                            "rule_id": rid,
+                            "title": RULE_TITLES.get(rid, rid),
+                            "severity": v.get("s", RULE_SEVERITY.get(rid, "major")),
+                            "required": True,
+                            "order": v.get("o", "timeline"),
+                            "where": v.get("w", "история болезни"),
+                            "evidence": v.get("e", ""),
+                        }
+            # подменяем результаты текущего чанка
+            assessed_list_probe = list(combined_assessed) or list(rules_this_chunk)
+            data = {"viol": [{"r": k, "s": combined_viol[k]["severity"], "o": combined_viol[k]["order"], "w": combined_viol[k]["where"], "e": combined_viol[k]["evidence"]} for k in combined_viol.keys()],
+                    "assessed": assessed_list_probe}
+            total_ms += retry_ms
+            total_bytes += retry_bytes
+            retry_stats = {"used": True, "extra_ms": retry_ms, "extra_bytes": retry_bytes}
         # ожидаем {"viol":[...], "assessed":[...]}
         assessed_list = data.get("assessed", []) or []
         # если пусто — заполним всем чанком
@@ -260,7 +317,7 @@ def audit_stac(text: str, llm_text: str | None = None) -> dict:
 
     llm_status.update({
         "ok": True,
-        "model": STAC_MODEL,
+    "model": model_used,
         "duration_ms": total_ms,
         "bytes": total_bytes,
         "chunks": len(chunks),
@@ -285,6 +342,8 @@ def audit_stac(text: str, llm_text: str | None = None) -> dict:
     if raw_full is not None:
         llm_status["raw_full"] = raw_full
     llm_status.pop("error", None)
+    if retry_stats:
+        llm_status["retry"] = retry_stats
     result["llm_status"] = llm_status
 
     return _ensure_status(result)

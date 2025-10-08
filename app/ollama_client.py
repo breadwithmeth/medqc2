@@ -57,6 +57,26 @@ def chat_ollama(
         "stream": False,
     }
 
+    # Дополнительные тюнинги через окружение (если заданы)
+    try:
+        _top_p = os.getenv("OLLAMA_TOP_P")
+        if _top_p is not None:
+            body["options"]["top_p"] = float(_top_p)
+    except Exception:
+        pass
+    try:
+        _top_k = os.getenv("OLLAMA_TOP_K")
+        if _top_k is not None:
+            body["options"]["top_k"] = int(_top_k)
+    except Exception:
+        pass
+    try:
+        _rp = os.getenv("OLLAMA_REPEAT_PENALTY")
+        if _rp is not None:
+            body["options"]["repeat_penalty"] = float(_rp)
+    except Exception:
+        pass
+
     if json_schema is not None:
         body["format"] = json_schema
     elif grammar:

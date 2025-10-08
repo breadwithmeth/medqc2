@@ -8,6 +8,8 @@
     if (!f) { alert('Выберите PDF-файл'); return; }
     const human = $('#human').checked;
     const format = $('#format').value;
+  const useFull = $('#useFull').checked;
+  const model = ($('#model').value || '').trim();
 
     const fd = new FormData();
     fd.append('file', f);
@@ -15,6 +17,8 @@
     const url = new URL('/audit/pdf_stac', apiBase);
     if (human) url.searchParams.set('human', 'true');
     if (human) url.searchParams.set('format', format);
+  if (useFull) url.searchParams.set('use_full', 'true');
+  if (model) url.searchParams.set('model', model);
 
     $('#run').disabled = true;
     $('#dlJson').disabled = true;

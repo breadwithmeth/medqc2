@@ -94,11 +94,19 @@ def build_system_instructions(rules: list[dict]) -> str:
 
     return f"{header}\n\nПРАВИЛА:\n" + "\n".join(lines) + "\n\n" + tail
 
-def build_modelfile(base: str, num_ctx: int, system: str) -> str:
-    system_escaped = system.replace('"""', '\\"""')
+def build_modelfile(base: str, num_ctx: int, system: str, params: dict[str, str | int | float] | None = None) -> str:
+    system_escaped = system.replace('"""', '\"""')
+    param_lines = [f"PARAMETER num_ctx {num_ctx}"]
+    params = params or {}
+    for key in ("temperature", "top_p", "top_k", "repeat_penalty", "num_predict"):
+        val = params.get(key)
+        if val is None:
+            continue
+        param_lines.append(f"PARAMETER {key} {val}")
+    params_block = "\n".join(param_lines)
     return dedent(f"""\
     FROM {base}
-    PARAMETER num_ctx {num_ctx}
+    {params_block}
     SYSTEM \"\"\"{system_escaped}\"\"\"
     """).lstrip()
 
@@ -110,6 +118,12 @@ def main():
     ap.add_argument("--name", default="medaudit:stac-strict")
     ap.add_argument("--num_ctx", type=int, default=3072)
     ap.add_argument("--include", nargs="+", default=["GEN","STAC"])
+    # Дополнительные параметры генерации (по умолчанию строгие)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top_p", type=float, default=0.2)
+    ap.add_argument("--top_k", type=int, default=20)
+    ap.add_argument("--repeat_penalty", type=float, default=1.1)
+    ap.add_argument("--num_predict", type=int, default=None)
     args = ap.parse_args()
 
     data = yaml.safe_load(Path(args.rules_yaml).read_text(encoding="utf-8"))
@@ -120,7 +134,14 @@ def main():
 
     system = build_system_instructions(chosen)
     out_path = Path(args.out_modelfile)
-    out_path.write_text(build_modelfile(args.base, args.num_ctx, system), encoding="utf-8")
+    params = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "repeat_penalty": args.repeat_penalty,
+        "num_predict": args.num_predict,
+    }
+    out_path.write_text(build_modelfile(args.base, args.num_ctx, system, params), encoding="utf-8")
     print(f"OK: Modelfile -> {out_path}")
     print(f"Создать модель:\n  ollama create {args.name} -f {out_path}")
 

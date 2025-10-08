@@ -52,6 +52,8 @@ async def audit_pdf_stac(
     file: UploadFile = File(...),
     human: bool = Query(False, description="Человекочитаемый компактный ответ"),
     format: str = Query("json", description="Формат человека: json|text|markdown", regex="^(json|text|markdown)$"),
+    use_full: bool = Query(False, description="Отдать LLM полный текст (медленнее, но шире покрытие)"),
+    model: str | None = Query(None, description="Переопределить модель Ollama для этого запроса"),
 ):
     blob = await file.read()
 
@@ -63,7 +65,11 @@ async def audit_pdf_stac(
     full_text = extract_text_from_pdf(blob)
     base_text = full_text if full_text else llm_text
 
-    result = audit_stac(base_text, llm_text=llm_text)
+    # приоритеты выбора входа для LLM: явный use_full параметр → env LLM_USE_FULL_TEXT → фокусированный текст
+    use_full_env = (os.getenv("LLM_USE_FULL_TEXT", "0").lower() in ("1", "true", "yes", "on"))
+    llm_in = full_text if (use_full or use_full_env) else llm_text
+
+    result = audit_stac(base_text, llm_text=llm_in, model=model)
     result.setdefault("debug_focus", {}).update(
         {
             "pages_used": focus.get("pages_used"),
