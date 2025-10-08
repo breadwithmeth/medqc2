@@ -43,7 +43,7 @@ def chat_ollama(
     Универсальный вызов Ollama /api/chat.
     Приоритет вывода: JSON-Schema > grammar > format=json.
     """
-    mdl = model or os.getenv("STAC_MODEL", "medaudit:stac-strict")
+    mdl = model or os.getenv("STAC_MODEL", "gpt-oss:latest")
 
     body: Dict[str, Any] = {
         "model": mdl,
@@ -84,6 +84,11 @@ def chat_ollama(
     elif use_json_format:
         body["format"] = "json"
 
+    # Возможность принудительно использовать /api/generate вместо /api/chat
+    use_chat_env = os.getenv("OLLAMA_USE_CHAT", "1").lower() in ("1", "true", "yes", "on")
+    if not use_chat_env and json_schema is None and grammar is None:
+        return generate_ollama(system, question, text, mdl, body.get("options", {}), keep_alive, timeout, connect_timeout, retries)
+
     last_err: Optional[Exception] = None
     for _ in range(max(1, retries + 1)):
         t0 = time.time()
@@ -96,12 +101,62 @@ def chat_ollama(
             msg = (payload.get("message") or {})
             content = msg.get("content") or payload.get("content") or ""
             if not content:
-                raise RuntimeError(f"Ollama empty content (dt={dt}ms)")
+                raise RuntimeError(f"Ollama empty content (dt={dt}ms, model={mdl})")
             return content
         except Exception as e:
             last_err = e
             time.sleep(0.2)
     raise RuntimeError(f"Ollama error: {last_err}")
+
+
+def generate_ollama(
+    system: str,
+    question: str,
+    text: str,
+    model: Optional[str] = None,
+    options: Optional[Dict[str, Any]] = None,
+    keep_alive: str = "30m",
+    timeout: int = 180,
+    connect_timeout: int = 5,
+    retries: int = 1,
+) -> str:
+    """
+    Вызов Ollama /api/generate. Собирает prompt из system + question + text. Без structured outputs.
+    Используйте как фолбэк, если /api/chat даёт пустые ответы на некоторых моделях (например, gpt-oss).
+    """
+    mdl = model or os.getenv("STAC_MODEL", "gpt-oss:latest")
+    prompt_parts = []
+    if system:
+        prompt_parts.append(system)
+    if question:
+        prompt_parts.append(question)
+    if text:
+        prompt_parts.append("=== ДОКУМЕНТ ===\n" + text)
+    prompt = "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+
+    body: Dict[str, Any] = {
+        "model": mdl,
+        "prompt": prompt,
+        "options": options or {},
+        "keep_alive": keep_alive,
+        "stream": False,
+    }
+
+    last_err: Optional[Exception] = None
+    for _ in range(max(1, retries + 1)):
+        try:
+            r = requests.post(f"{OLLAMA_URL}/api/generate", json=body, timeout=(connect_timeout, timeout))
+            if r.status_code != 200:
+                raise RuntimeError(f"Ollama generate {r.status_code}: {r.text[:400]}")
+            payload = r.json()
+            content = payload.get("response") or payload.get("content") or ""
+            if not content:
+                raise RuntimeError("Ollama generate empty content")
+            return content
+        except Exception as e:
+            last_err = e
+            time.sleep(0.2)
+    raise RuntimeError(f"Ollama generate error: {last_err}")
 
 
 def get_tags(timeout: int = 5, connect_timeout: int = 3) -> dict:
@@ -115,7 +170,7 @@ def schema_smoke_test(timeout: int = 12, connect_timeout: int = 3) -> bool:
     Проверяет поддержку structured outputs (JSON-Schema) у текущей версии Ollama.
     """
     body = {
-        "model": os.getenv("STAC_MODEL", "llama3.1:8b-instruct-q4_0"),
+    "model": os.getenv("STAC_MODEL", "gpt-oss:latest"),
         "messages": [{"role": "user", "content": "schema test"}],
         "format": {
             "type": "object",
@@ -147,7 +202,7 @@ def quick_ping() -> dict:
     try:
         t0 = time.time()
         body = {
-            "model": os.getenv("STAC_MODEL", "llama3.1:8b-instruct-q4_0"),
+            "model": os.getenv("STAC_MODEL", "gpt-oss:latest"),
             "messages": [{"role": "user", "content": "ping"}],
             "format": {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
             "stream": False,
@@ -159,10 +214,10 @@ def quick_ping() -> dict:
         msg = (payload.get("message") or {})
         content = msg.get("content") or ""
         ok = content.strip().startswith("{") and '"ok"' in content
-        return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", "")}
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
-        return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", ""), "error": err}
+    return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", ""), "error": err}
+    return {"ok": ok, "duration_ms": dt, "model": os.getenv("STAC_MODEL", "")}
 
 
 def grammar_smoke_test(timeout: int = 12, connect_timeout: int = 3) -> bool:
@@ -176,7 +231,7 @@ obj  ::= "{" ws "\"ok\"" ws ":" ws "true" ws "}"
 ws   ::= ([ \t\n\r])*
 '''
     body = {
-        "model": os.getenv("STAC_MODEL", "llama3.1:8b-instruct-q4_0"),
+        "model": os.getenv("STAC_MODEL", "gpt-oss:latest"),
         "messages": [{"role": "user", "content": "grammar test"}],
         "options": {"grammar": GRAMMAR},
         "stream": False,

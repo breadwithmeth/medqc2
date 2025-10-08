@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .audit_engine_stac import audit_stac
 from .ollama_client import quick_ping, get_tags, schema_smoke_test, grammar_smoke_test
+from .openai_compat_client import ping_openai_compat
 from .pdf_smart_reader import smart_focus_for_llm
 from .pdf_text import extract_text_from_pdf
 from .humanize import build_human_report
@@ -136,3 +137,14 @@ def dbg_grammar():
 @app.get("/debug/llm_ping")
 def llm_ping():
     return quick_ping()
+
+
+@app.get("/debug/provider")
+def dbg_provider():
+    """Показывает доступность провайдеров (Ollama/OpenAI-совместимый)."""
+    out = {"ollama": quick_ping()}
+    try:
+        out["openai_compat"] = ping_openai_compat()
+    except Exception as e:
+        out["openai_compat"] = {"ok": False, "error": str(e)}
+    return out

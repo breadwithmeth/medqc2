@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json, os, re
 from typing import Dict, List, Tuple
-from .ollama_client import chat_ollama
+from .llm_router import chat_llm
 
 PROFILE_LABELS: Dict[str, str] = {
     "GEN":"Общие", "STAC":"Стационар", "DHS":"Дневной стационар", "ER":"Приёмное",
@@ -62,8 +62,8 @@ def heuristic_profiles(text: str, limit: int = 3) -> list[str]:
     return out
 
 def classify_profiles_llm(text: str, limit: int = 3) -> tuple[list[str], dict[str,float], str]:
-    model = os.getenv("ROUTER_MODEL") or os.getenv("OLLAMA_MODEL") or "llama3.1:8b-instruct-q5_1"
-    raw = chat_ollama(ROUTER_SYSTEM, ROUTER_USER, text, model=model, num_predict=128, num_ctx=1024)
+    model = os.getenv("ROUTER_MODEL") or os.getenv("OPENAI_MODEL") or os.getenv("STAC_MODEL") or os.getenv("OLLAMA_MODEL") or "gpt-oss:latest"
+    raw = chat_llm(ROUTER_SYSTEM, ROUTER_USER, text, model=model, num_predict=128, num_ctx=1024, use_json_format=True)
     try:
         data = json.loads(raw)
         profs = [p for p in data.get("profiles", []) if p in PROFILE_LABELS]

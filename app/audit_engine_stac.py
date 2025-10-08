@@ -3,7 +3,8 @@ from __future__ import annotations
 import os, time
 from typing import Any, Dict, List, Tuple, Optional
 
-from .ollama_client import chat_ollama, schema_smoke_test, grammar_smoke_test
+from .ollama_client import schema_smoke_test, grammar_smoke_test
+from .llm_router import chat_llm
 from .gbnf import COMPACT_AUDIT_GBNF
 from .utils_json import coerce_json
 from .timeline_extractor import extract_timeline
@@ -16,8 +17,9 @@ from .json_schema import (
     COMPACT_AUDIT_SCHEMA,
 )
 from .focus_text import focus_text
+from .rag import get_global_context, get_rule_hints
 
-STAC_MODEL = os.getenv("STAC_MODEL", "medaudit:stac-strict")
+STAC_MODEL = os.getenv("STAC_MODEL", "gpt-oss:latest")
 
 # ---------- утилиты ----------
 def _ensure_status(data: dict) -> dict:
@@ -184,14 +186,23 @@ def audit_stac(text: str, llm_text: str | None = None, model: Optional[str] = No
     parse_errors = 0
     assessed_weak_chunks = 0
     retry_used = False
+    llm_errors = 0
+    llm_last_error = ""
     retry_stats: Dict[str, Any] = {}
 
     def _call_chunk(rules_this_chunk: List[str], num_predict_override: int | None = None, model_override: str | None = None):
         q = _compact_question(rules_this_chunk, LIMIT_ITEMS, EV_MAX)
         t0 = time.time()
         per_chunk_schema = _chunk_schema(rules_this_chunk, EV_MAX, LIMIT_ITEMS) if chosen_mode == "schema" else None
-        raw = chat_ollama(
-            system="Ты строгий аудитор медицинских документов РК. Возвращай только валидный JSON по заданной схеме, без какого-либо текста вне JSON.",
+        # RAG-контекст: глобальные подсказки + краткие подсказки по правилам чанка
+        global_ctx = get_global_context()
+        rule_hints = get_rule_hints(rules_this_chunk)
+        system_ctx = (
+            "Ты строгий аудитор медицинских документов РК. Возвращай только валидный JSON по заданной схеме, без какого-либо текста вне JSON.\n"
+            f"[Глобальный контекст]\n{global_ctx}\n[Подсказки по правилам]\n{rule_hints}"
+        )
+        raw = chat_llm(
+            system=system_ctx,
             question=q,
             text=condensed,
             model=(model_override or model_used),
@@ -199,10 +210,10 @@ def audit_stac(text: str, llm_text: str | None = None, model: Optional[str] = No
             num_predict=(num_predict_override or NUM_PREDICT),
             num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "3072")),
             keep_alive=os.getenv("KEEP_ALIVE", "30m"),
-            use_json_format=(chosen_mode == "json"),
+            use_json_format=(chosen_mode in ("json", "schema")),
             timeout=int(os.getenv("OLLAMA_TIMEOUT_READ", "180")),
             connect_timeout=int(os.getenv("OLLAMA_TIMEOUT_CONNECT", "5")),
-            retries=int(os.getenv("OLLAMA_RETRIES", "0")),
+            retries=int(os.getenv("OLLAMA_RETRIES", "1")),
             grammar=(COMPACT_AUDIT_GBNF if chosen_mode == "grammar" else None),
             json_schema=(per_chunk_schema if chosen_mode == "schema" else None),
         )
@@ -211,7 +222,13 @@ def audit_stac(text: str, llm_text: str | None = None, model: Optional[str] = No
 
     for rules_this_chunk in chunks:
         rules_per_chunk.append(list(rules_this_chunk))
-        raw, dt = _call_chunk(rules_this_chunk)
+        try:
+            raw, dt = _call_chunk(rules_this_chunk)
+        except Exception as e:
+            # Перехватываем сбой LLM на чанке: не валим весь аудит, а подставляем пустой JSON
+            llm_errors += 1
+            llm_last_error = str(e)
+            raw, dt = '{"viol": [], "assessed": []}', 0
         total_ms += dt
         total_bytes += len(raw.encode("utf-8"))
         if len(raw_samples) < SAMPLES_MAX:
@@ -317,7 +334,7 @@ def audit_stac(text: str, llm_text: str | None = None, model: Optional[str] = No
 
     llm_status.update({
         "ok": True,
-    "model": model_used,
+        "model": model_used,
         "duration_ms": total_ms,
         "bytes": total_bytes,
         "chunks": len(chunks),
@@ -344,6 +361,11 @@ def audit_stac(text: str, llm_text: str | None = None, model: Optional[str] = No
     llm_status.pop("error", None)
     if retry_stats:
         llm_status["retry"] = retry_stats
+    if llm_errors:
+        llm_status["errors"] = llm_errors
+        llm_status["last_error"] = llm_last_error[:240]
+    # Укажем, используется ли /api/chat или /api/generate
+    llm_status["transport"] = "generate" if os.getenv("OLLAMA_USE_CHAT", "1").lower() in ("0", "false", "no", "off") else "chat"
     result["llm_status"] = llm_status
 
     return _ensure_status(result)
